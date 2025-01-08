@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""
+Josh - The Helping Hand Robot (with Camera & Coral Scaffold)
+
+Features:
+1) Listens for "Josh, come hold this" via speech recognition.
+2) Moves forward until palm IR sensors detect an object, then grips it.
+3) Shows camera feed in a window (OpenCV).
+4) Includes basic Google Coral USB Accelerator setup (no detection by default).
+5) Allows easy grip-strength tweaking.
+
+Adjust constants (pin numbers, GRIP_CLOSE_ANGLE, etc.) for your setup.
+"""
+
+import time
+import sys
+import cv2
+import board
+import busio
+import RPi.GPIO as GPIO
+import adafruit_pca9685
+# from mpu6050 import mpu6050  # Only needed if you want IMU data; comment out if not used
+import speech_recognition as sr
+
+# Coral imports (comment out if not using Coral right now)
+try:
+    from pycoral.utils.edgetpu import make_interpreter
+    from pycoral.adapters import common
+    CORAL_AVAILABLE = True
+except ImportError:
+    print("PyCoral not installed or Edge TPU libraries missing. Continuing without Coral.")
+    CORAL_AVAILABLE = False
+
+#####################################
+# CONFIG SECTION
+#####################################
+
+# Motor driver pins (example: L298N):
+IN1, IN2, PWM_A = 5, 6, 12   # left motor
+IN3, IN4, PWM_B = 13, 19, 26 # right motor
+
+# IR sensors in palms:
+IR_PALM_LEFT  = 20
+IR_PALM_RIGHT = 21
+
+# PCA9685 servo frequency:
+I2C_FREQ = 50
+
+# Servo channels for the hands:
+LEFT_THUMB_CH   = 4
+LEFT_MITTEN_CH  = 5
+RIGHT_THUMB_CH  = 10
+RIGHT_MITTEN_CH = 11
+
+# Grip angles:
+GRIP_CLOSE_ANGLE = 70  # Increase to tighten grip
+GRIP_OPEN_ANGLE  = 30  # Default open angle
+
+# Robot movement speed:
+MOVE_SPEED = 0.4  # 0..1.0
+
+# Phrase detection:
+WAKE_PHRASE = "josh come hold this"  # We'll look for these words
+
+#####################################
+# SETUP & INITIALIZATION
+#####################################
+
+GPIO.setmode(GPIO.BCM)
+
+# Motor pins:
+for pin in [IN1, IN2, IN3, IN4]:
+    GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+GPIO.setup(PWM_A, GPIO.OUT)
+GPIO.setup(PWM_B, GPIO.OUT)
+pwmA = GPIO.PWM(PWM_A, 1000)
+pwmB = GPIO.PWM(PWM_B, 1000)
+pwmA.start(0)
+pwmB.start(0)
+
+def set_motor_speeds(left_speed, right_speed):
+    """Set left & right motor speeds, range -1.0..+1.0."""
+    # Left motor
+    if left_speed >= 0:
+        GPIO.output(IN1, GPIO.HIGH)
+        GPIO.output(IN2, GPIO.LOW)
+        dutyL = left_speed * 100
+    else:
+        GPIO.output(IN1, GPIO.LOW)
+        GPIO.output(IN2, GPIO.HIGH)
+        dutyL = -left_speed * 100
+    pwmA.ChangeDutyCycle(min(max(dutyL, 0), 100))
+
+    # Right motor
+    if right_speed >= 0:
+        GPIO.output(IN3, GPIO.HIGH)
+        GPIO.output(IN4, GPIO.LOW)
+        dutyR = right_speed * 100
+    else:
+        GPIO.output(IN3, GPIO.LOW)
+        GPIO.output(IN4, GPIO.HIGH)
+        dutyR = -right_speed * 100
+    pwmB.ChangeDutyCycle(min(max(dutyR, 0), 100))
+
+# IR palm sensors:
+GPIO.setup(IR_PALM_LEFT,  GPIO.IN)
+GPIO.setup(IR_PALM_RIGHT, GPIO.IN)
+
+# Servo driver (PCA9685) setup:
+i2c = busio.I2C(board.SCL, board.SDA)
+pca = adafruit_pca9685.PCA9685(i2c)
+pca.frequency = I2C_FREQ
+
+def angle_to_duty(angle):
+    """Convert 0-180 angle to PCA9685 duty cycle (16-bit)."""
+    min_pulse = 150
+    max_pulse = 600
+    angle = max(0, min(180, angle))
+    pulse = int((angle / 180) * (max_pulse - min_pulse) + min_pulse)
+    return pulse << 4  # 12-bit -> 16-bit shift
+
+def set_servo(channel, angle):
+    duty = angle_to_duty(angle)
+    pca.channels[channel].duty_cycle = duty
+
+def open_hands():
+    set_servo(LEFT_THUMB_CH,   GRIP_OPEN_ANGLE)
+    set_servo(LEFT_MITTEN_CH,  GRIP_OPEN_ANGLE)
+    set_servo(RIGHT_THUMB_CH,  GRIP_OPEN_ANGLE)
+    set_servo(RIGHT_MITTEN_CH, GRIP_OPEN_ANGLE)
+
+def close_hands():
+    set_servo(LEFT_THUMB_CH,   GRIP_CLOSE_ANGLE)
+    set_servo(LEFT_MITTEN_CH,  GRIP_CLOSE_ANGLE)
+    set_servo(RIGHT_THUMB_CH,  GRIP_CLOSE_ANGLE)
+    set_servo(RIGHT_MITTEN_CH, GRIP_CLOSE_ANGLE)
+
+# Speech Recognition Setup
+recognizer = sr.Recognizer()
+mic = sr.Microphone()
+
+# Optional: set up Coral if available
+if CORAL_AVAILABLE:
+    # Example: load a TFLite model (just an example placeholder!)
+    # model_path = "/home/pi/your_model.tflite"
+    # interpreter = make_interpreter(model_path)
+    # interpreter.allocate_tensors()
+    print("Coral USB Accelerator found. Model loading example is commented out in code.")
+else:
+    print("No Coral or pycoral not installed. Skipping accelerator init.")
+
+#####################################
+# CAMERA SETUP
+#####################################
+cap = cv2.VideoCapture(0)  # If only one camera, index 0
+if not cap.isOpened():
+    print("Camera not opened. Check camera connection.")
+    sys.exit(1)
+
+#####################################
+# MAIN LOGIC
+#####################################
+
+def listen_for_command():
+    """Listen once, return recognized text (lowercased) or None if not recognized."""
+    with mic as source:
+        recognizer.adjust_for_ambient_noise(source, duration=1)
+        print("Listening...")
+        audio = recognizer.listen(source)
+    try:
+        text = recognizer.recognize_google(audio).lower()
+        print("Heard:", text)
+        return text
+    except sr.UnknownValueError:
+        print("Speech: Could not understand audio.")
+        return None
+    except sr.RequestError as e:
+        print(f"Speech service error: {e}")
+        return None
+
+def main():
+    try:
+        open_hands()
+        time.sleep(1)
+        print("Josh is awake. Grip strength set via GRIP_CLOSE_ANGLE =", GRIP_CLOSE_ANGLE)
+
+        while True:
+            # 1) Show camera feed
+            ret, frame = cap.read()
+            if ret:
+                # (Optional) do Coral inference here if you have a model loaded
+                # ...
+                # For now, just display the camera
+                cv2.imshow("Josh RobotCam", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    print("User pressed 'q'. Exiting camera loop.")
+                    break
+            else:
+                print("Camera frame not received properly.")
+                time.sleep(0.1)
+
+            # 2) Check for voice command
+            print("Say 'Josh, come hold this' or press Ctrl+C to quit.")
+            text = listen_for_command()
+            if text and WAKE_PHRASE in text.replace(",", "").replace(".", ""):
+                # Robot moves forward
+                print("Heard the wake phrase. Moving forward to hold object...")
+                set_motor_speeds(MOVE_SPEED, MOVE_SPEED)
+
+                # Keep moving until palm sensors detect object or timeout
+                start_time = time.time()
+                while True:
+                    left_palm  = GPIO.input(IR_PALM_LEFT)  # 0 if object detected
+                    right_palm = GPIO.input(IR_PALM_RIGHT)
+
+                    if left_palm == 0 or right_palm == 0:
+                        print("Palm sensor triggered. Stopping and grabbing object.")
+                        set_motor_speeds(0, 0)
+                        close_hands()
+                        break
+
+                    if time.time() - start_time > 5:
+                        print("Timeout: no object detected, stopping.")
+                        set_motor_speeds(0, 0)
+                        break
+
+                    # also keep the camera feed alive
+                    ret, frame = cap.read()
+                    if ret:
+                        cv2.imshow("Josh RobotCam", frame)
+                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                            print("User pressed 'q'. Exiting movement loop.")
+                            set_motor_speeds(0, 0)
+                            break
+                    time.sleep(0.1)
+
+                print("Holding object. Adjust your grip angle if needed.")
+                time.sleep(2)  # hold object for demonstration
+
+    except KeyboardInterrupt:
+        print("\nUser interrupted with Ctrl+C.")
+    finally:
+        print("Shutting down. Opening hands, stopping motors, cleaning up.")
+        open_hands()
+        set_motor_speeds(0, 0)
+        cap.release()
+        cv2.destroyAllWindows()
+        pca.deinit()
+        GPIO.cleanup()
+
+if __name__ == "__main__":
+    main()
